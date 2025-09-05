@@ -1,0 +1,16 @@
+# LMCACHE_USE_EXPERIMENTAL MUST be set by environment variable directly.
+
+# Basic configurations
+chunk_size: 128
+
+# CPU offloading configurations
+local_cpu: true
+max_local_cpu_size: 60  # 5GB CPU memory limit
+
+# local_disk: "/home/yshan/mnt/LMCache/local_disk"
+# max_local_disk_size: 100.0
+
+
+# Verbose logging
+verbose: true
+
