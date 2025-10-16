@@ -5,10 +5,10 @@ chunk_size: 128
 
 # CPU offloading configurations
 local_cpu: true
-max_local_cpu_size: 60  # 5GB CPU memory limit
+max_local_cpu_size: 5  # 5GB CPU memory limit
 
-# local_disk: "/home/yshan/mnt/LMCache/local_disk"
-# max_local_disk_size: 100.0
+local_disk: "/home/yshan/mnt/LMCache/local_disk"
+max_local_disk_size: 20.0
 
 
 # Verbose logging

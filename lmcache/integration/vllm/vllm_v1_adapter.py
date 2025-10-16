@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
 import uuid
+from collections import defaultdict
 
 # Third Party
 from vllm.config import (
@@ -678,6 +679,8 @@ class LMCacheConnectorV1Impl:
             logger.debug("In connector.start_load_kv, but the attn_metadata is None")
             return
 
+        scheduling_guidance = kwargs.get("scheduling_guidance", None)
+
         assert self.lmcache_engine is not None
 
         self.lmcache_engine.post_init(kvcaches=kvcaches)
@@ -740,6 +743,7 @@ class LMCacheConnectorV1Impl:
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
                     request_configs=request.request_configs,
+                    scheduling_guidance=scheduling_guidance,
                 )
 
                 # Check the result
@@ -852,14 +856,14 @@ class LMCacheConnectorV1Impl:
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
 
-                logger.info(
-                    "Storing KV cache for %d out of %d tokens "
-                    "(skip_leading_tokens=%d) for request %s",
-                    len(token_ids) - skip_leading_tokens,
-                    len(token_ids),
-                    skip_leading_tokens,
-                    request.req_id,
-                )
+                # logger.info(
+                #     "Storing KV cache for %d out of %d tokens "
+                #     "(skip_leading_tokens=%d) for request %s",
+                #     len(token_ids) - skip_leading_tokens,
+                #     len(token_ids),
+                #     skip_leading_tokens,
+                #     request.req_id,
+                # )
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
@@ -937,14 +941,14 @@ class LMCacheConnectorV1Impl:
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
 
-            logger.info(
-                "Storing KV cache for %d out of %d tokens "
-                "(skip_leading_tokens=%d) for request %s",
-                len(token_ids) - skip_leading_tokens,
-                len(token_ids),
-                skip_leading_tokens,
-                request.req_id,
-            )
+            # logger.info(
+            #     "Storing KV cache for %d out of %d tokens "
+            #     "(skip_leading_tokens=%d) for request %s",
+            #     len(token_ids) - skip_leading_tokens,
+            #     len(token_ids),
+            #     skip_leading_tokens,
+            #     request.req_id,
+            # )
 
             is_last_prefill = request.is_last_prefill
             if is_last_prefill:
@@ -1067,6 +1071,81 @@ class LMCacheConnectorV1Impl:
         #        self._block_size
 
         return need_to_allocate
+
+
+    @_lmcache_nvtx_annotate
+    def get_num_new_matched_tokens_detailed(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int, dict]:
+        """
+        Check for external KV cache hit.
+
+        Args:
+            request (Request): the request object.
+            num_computed_tokens (int): the number of locally
+                computed tokens for this request
+
+        Returns:
+            the number of tokens that can be loaded from the
+            external KV cache beyond what is already computed.
+        """
+        if self.kv_role == "kv_producer" and not hasattr(
+            self.lookup_client, "supports_producer_reuse"
+        ):
+            return 0, defaultdict(int)
+
+        token_ids = request.prompt_token_ids
+
+        # If the request has multimodal hashes, apply them to the token ids
+        if request.mm_hashes:
+            # TODO(Jiayi): Optimize this
+            token_ids = torch.tensor(request.prompt_token_ids)
+            apply_mm_hashes_to_token_ids(
+                token_ids, request.mm_hashes, request.mm_positions
+            )
+            token_ids = token_ids.tolist()
+
+        lookup_id = str(uuid.uuid4())
+        self._lookup_requests_in_step.append(lookup_id)
+
+        request_configs = extract_request_configs(request.sampling_params)
+        if self.skip_last_n_tokens > 0:
+            num_external_hit_tokens, backend_detailed_hit_tokens = self.lookup_client.detailed_lookup(
+                token_ids[: -self.skip_last_n_tokens],
+                lookup_id=lookup_id,
+                request_configs=request_configs,
+            )
+        else:
+            num_external_hit_tokens, backend_detailed_hit_tokens = self.lookup_client.detailed_lookup(
+                token_ids,
+                lookup_id=lookup_id,
+                request_configs=request_configs,
+            )
+
+        num_backend_hit_tokens = defaultdict(int)
+        for backend_name, locations in backend_detailed_hit_tokens.items():
+            if backend_name in ("LocalCPUBackend", "LocalDiskBackend"):
+                for start_idx, end_idx in locations:
+                    if start_idx is None or end_idx is None:
+                        continue
+                    if end_idx > num_computed_tokens:
+                        num_backend_hit_tokens[backend_name] += end_idx - start_idx
+
+        need_to_allocate = num_external_hit_tokens - num_computed_tokens
+
+        # In, full-prompt-hit case, we need to recompute the last token
+        if num_external_hit_tokens == request.num_tokens:
+            need_to_allocate -= 1
+
+        self.load_specs[request.request_id] = LoadSpec(
+            vllm_cached_tokens=num_computed_tokens,
+            lmcache_cached_tokens=num_external_hit_tokens,
+            can_load=False,
+        )
+
+        return need_to_allocate, num_backend_hit_tokens
 
     @_lmcache_nvtx_annotate
     def update_state_after_alloc(self, request: "Request", num_external_tokens: int):

@@ -39,6 +39,7 @@ class LMCacheLookupClient(LookupClientInterface):
         metadata, config = create_lmcache_metadata(vllm_config)
 
         self.encoder = msgspec.msgpack.Encoder()
+        self.decoder = msgspec.msgpack.Decoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         rpc_port = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache_rpc_port", 0
@@ -107,6 +108,7 @@ class LMCacheLookupClient(LookupClientInterface):
                 [f"{k}%{v}" for k, v in request_configs.items()]
             )
         request_configs_buf = request_configs_str.encode("utf-8")
+        detailed_flag = self.encoder.encode(False)
         ranks = self.tensor_parallel_size
         if self.create_lookup_server_only_on_worker_0_for_mla:
             ranks = 1
@@ -116,6 +118,7 @@ class LMCacheLookupClient(LookupClientInterface):
             offset_buf,
             lookup_id_buf,
             request_configs_buf,
+            detailed_flag
         ]  # hash_offset_bufs+ [lookup_id_buf, request_configs_buf]
         for i in range(ranks):
             self.sockets[i].send_multipart(msg_buf, copy=False)
@@ -135,6 +138,71 @@ class LMCacheLookupClient(LookupClientInterface):
         # across TP ranks, so we can use the minimum value as the
         # number of hit tokens.
         return min(results)
+    
+    def detailed_lookup(
+        self,
+        token_ids: Union[torch.Tensor, list[int]],
+        lookup_id: str,
+        request_configs: Optional[dict] = None,
+    ) -> tuple:
+        hashes = []
+        offsets = []
+        
+        for start, end, key in self.token_database.process_tokens(
+            token_ids, make_key=False
+        ):
+            hashes.append(key)
+            offsets.append(end - start)
+        hash_buf = self.encoder.encode(hashes)
+        offset_buf = self.encoder.encode(offsets)
+
+        lookup_id_buf = lookup_id.encode("utf-8")
+        request_configs_str = ""
+        if request_configs is not None and len(request_configs) != 0:
+            request_configs_str = "@".join(
+                [f"{k}%{v}" for k, v in request_configs.items()]
+            )
+        request_configs_buf = request_configs_str.encode("utf-8")
+        detailed_flag = self.encoder.encode(True)
+        ranks = self.tensor_parallel_size
+        if self.create_lookup_server_only_on_worker_0_for_mla:
+            ranks = 1
+        results = []
+        msg_buf = [
+            hash_buf,
+            offset_buf,
+            lookup_id_buf,
+            request_configs_buf,
+            detailed_flag
+        ]  # hash_offset_bufs+ [lookup_id_buf, request_configs_buf]
+        for i in range(ranks):
+            self.sockets[i].send_multipart(msg_buf, copy=False)
+
+        # TODO(Jiayi): we can use zmq poll to optimize a bit
+        for i in range(ranks):
+            resp = self.sockets[i].recv()
+            item = self.decoder.decode(resp) 
+            results.append(item)
+        # print(f"[MY LOG] RESULTS [TYPE]: {type(results[0])}  [VALUE]: {results[0]}")
+        # hits = [(r[0] if isinstance(r, tuple) else int(r), idx)
+                # for idx, r in enumerate(results)]
+        def _extract_count(r):
+            if isinstance(r, (tuple, list)):
+                return int(r[0]) if r else 0
+            return int(r)
+        hits = [(_extract_count(r), idx) for idx, r in enumerate(results)]
+
+
+        if len({h for h, _ in hits}) > 1:
+            logger.warning(
+                f"Lookup results (number of hit tokens) differ "
+                f"across tensor parallel ranks: {results}."
+            )
+        _, min_idx = min(hits, key=lambda x: x[0])
+        # NOTE: it is possible that the number of hit tokens is different
+        # across TP ranks, so we can use the minimum value as the
+        # number of hit tokens.
+        return results[min_idx]
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports producer kvcache reuse"""
@@ -149,6 +217,7 @@ class LMCacheLookupServer:
 
     def __init__(self, lmcache_engine: LMCacheEngine, vllm_config: "VllmConfig"):
         self.decoder = msgspec.msgpack.Decoder()
+        self.encoder = msgspec.msgpack.Encoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         rpc_port = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache_rpc_port", 0
@@ -172,8 +241,9 @@ class LMCacheLookupServer:
                 hash_frames = frames[0]
                 offset_frames = frames[1]
 
-                lookup_id = frames[-2].bytes.decode("utf-8")
-                request_configs_str = frames[-1].bytes.decode("utf-8")
+                lookup_id = frames[-3].bytes.decode("utf-8")
+                request_configs_str = frames[-2].bytes.decode("utf-8")
+                detailed_flag = self.decoder.decode(frames[-1])
                 request_configs = None
                 if request_configs_str != "":
                     request_configs = {}
@@ -186,15 +256,25 @@ class LMCacheLookupServer:
 
                 hashes = self.decoder.decode(hash_frames)
                 offsets = self.decoder.decode(offset_frames)
-                result = self.lmcache_engine.lookup(
+                if detailed_flag:
+                    lookup_func = self.lmcache_engine.detailed_lookup
+                else:
+                    lookup_func = self.lmcache_engine.lookup
+                result = lookup_func(
                     hashes=hashes,
                     offsets=offsets,
                     lookup_id=lookup_id,
                     pin=True,
                     request_configs=request_configs,
                 )
-                response = result.to_bytes(4, "big")
-                self.socket.send(response)
+                if detailed_flag:
+                    # 原样发 tuple：msgpack 单帧
+                    end, meta = result
+                    payload = self.encoder.encode((end, dict(meta)))
+                    self.socket.send(payload)
+                else:
+                    # 旧协议：4 字节 int（必要时可加 range 校验）
+                    self.socket.send(int(result).to_bytes(4, "big"))
                 # except Exception as e:
                 #    logger.error("Error in LMCache lookup server: %s", e)
                 #    break

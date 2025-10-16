@@ -56,6 +56,8 @@ from lmcache.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
+from collections import defaultdict
+from contextlib import nullcontext
 
 logger = init_logger(__name__)
 
@@ -301,17 +303,17 @@ class LMCacheEngine:
         if self.lookup_server is not None:
             self.lookup_server.batched_insert(keys)
 
-        logger.info(
-            "Stored %d out of total %d tokens. size: %.4f gb, cost %.4f ms, "
-            "throughput: %.4f GB/s; offload_time: %.4f ms, put_time: %.4f ms",
-            tot_token_num,
-            num_to_store_tokens,
-            tot_kv_size / 1024**3,
-            tot_time * 1000,
-            tot_kv_size / tot_time / 1024**3,
-            offload_time * 1000,
-            put_time * 1000,
-        )
+        # logger.info(
+        #     "Stored %d out of total %d tokens. size: %.4f gb, cost %.4f ms, "
+        #     "throughput: %.4f GB/s; offload_time: %.4f ms, put_time: %.4f ms",
+        #     tot_token_num,
+        #     num_to_store_tokens,
+        #     tot_kv_size / 1024**3,
+        #     tot_time * 1000,
+        #     tot_kv_size / tot_time / 1024**3,
+        #     offload_time * 1000,
+        #     put_time * 1000,
+        # )
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
 
@@ -465,6 +467,8 @@ class LMCacheEngine:
         tot_kv_size = 0
         t = time.perf_counter()
 
+        scheduling_guidance = kwargs.get("scheduling_guidance", None)
+
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
         else:
@@ -491,11 +495,17 @@ class LMCacheEngine:
         # cpu tensor for the sake of performance.
         # For example, disk->gpu is faster than disk->cpu->gpu.
         # RDMA is another example.
+
+        retrieved_tokens = torch.sum(ret_mask)
         if len(reordered_chunks) > 0:
             _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
-            self.gpu_connector.batched_to_gpu(
-                list(memory_objs), list(starts), list(ends), **kwargs
-            )
+            time_ctx = (scheduling_guidance.time_block("cpu2gpu_per_token", retrieved_tokens)
+                if scheduling_guidance is not None
+                else nullcontext())
+            with time_ctx:
+                self.gpu_connector.batched_to_gpu(
+                    list(memory_objs), list(starts), list(ends), **kwargs
+                )
 
         # TODO(Jiayi): Remove the following for loop with batched operations
         for key, memory_obj, _, _ in reordered_chunks:
@@ -505,7 +515,6 @@ class LMCacheEngine:
 
         onload_time = time.perf_counter() - t
 
-        retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
         logger.info(
             "Retrieved %d out of total %d out of total %d tokens. size: %.4f gb,"
@@ -772,6 +781,107 @@ class LMCacheEngine:
             # vllm lookup sets pin to True
             if pin:
                 self.storage_manager.touch_cache()
+
+    @_lmcache_nvtx_annotate
+    def detailed_lookup(
+        self,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
+        search_range: Optional[List[str]] = None,
+        lookup_id: Optional[str] = None,
+        pin: bool = False,
+        request_configs: Optional[dict] = None,
+    ) -> tuple:
+        """
+        A detailed version of lookup() function, which is mainly used to guide the vllm scheduler to minimize the TTFT metric.
+        """
+
+        if tokens is not None:
+            self.stats_monitor.on_lookup_request(len(tokens))
+        else:
+            assert offsets is not None
+            assert hashes is not None
+            self.stats_monitor.on_lookup_request(sum(offsets))
+
+        try:
+            end = 0
+            prev_end = 0
+
+            if pin:
+                assert lookup_id is not None, "lookup_id is required when pin is True"
+
+            # secondary lookup on p2p (via lookup_server) if enabled
+            search_p2p = self.enable_p2p and (
+                search_range is None or "p2p" in search_range
+            )
+
+            backend_detailed_hit_tokens = defaultdict(list)
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                hashes=hashes,
+                offsets=offsets,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+
+                if self.use_layerwise:
+                    # TODO(Jiayi): Optimize by checking only the existence of the key
+                    # of one layer
+                    key_all_layers = key.split_layers(self.num_layers)
+
+                    found = False
+                    for key_single_layer in key_all_layers:
+                        backend_name = self.storage_manager.contains(
+                            key_single_layer, search_range, pin
+                        )
+                        if backend_name:
+                            found = True
+                        if search_p2p:
+                            assert self.lookup_server is not None
+                            if self.lookup_server.lookup(key_single_layer):
+                                backend_name = "P2P"
+                                found = True
+                    if found:
+                        if pin:
+                            self.lookup_pins[lookup_id].extend(  # type: ignore
+                                key_all_layers
+                            )
+                        prev_end = end
+                        backend_detailed_hit_tokens[backend_name].append((start, end))
+                        continue
+                    end = prev_end
+                    return prev_end, backend_detailed_hit_tokens
+                else:
+                    backend_name = self.storage_manager.contains(key, search_range, pin)
+                    if backend_name:
+                        if pin:
+                            self.lookup_pins[lookup_id].append(  # type: ignore
+                                key
+                            )
+                        prev_end = end
+                        backend_detailed_hit_tokens[backend_name].append((start, end))
+                        continue
+
+                    if search_p2p:
+                        assert self.lookup_server is not None
+                        # TODO(Jiayi): We need to support pin for remote lookup
+                        if self.lookup_server.lookup(key):
+                            prev_end = end
+                            backend_name = "P2P"
+                            backend_detailed_hit_tokens[backend_name].append((start, end))
+                            continue
+                    end = prev_end
+                    return prev_end, backend_detailed_hit_tokens
+
+            # all tokens where found, return the maximal end
+            return end, backend_detailed_hit_tokens
+        finally:
+            self.stats_monitor.on_lookup_finished(end)
+            # vllm lookup sets pin to True
+            if pin:
+                self.storage_manager.touch_cache()
+
 
     @_lmcache_nvtx_annotate
     def move(
@@ -1052,6 +1162,8 @@ class LMCacheEngine:
         # [(CacheEngineKey, MemoryObj, start, end)]
         reordered_chunks: List[Tuple[CacheEngineKey, MemoryObj, int, int]] = []
 
+        scheduling_guidance = kwargs.get("scheduling_guidance", None)
+
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -1102,11 +1214,30 @@ class LMCacheEngine:
         # different storage backends.
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
-            keys = [key for key, _, _ in blocks]
-            memory_objs = self.storage_manager.batched_get(
-                keys=keys,
-                location=location,
-            )
+            retrieved_tokens = 0
+            keys = []
+            for key, _start, _end in blocks:
+                keys.append(key)
+                retrieved_tokens += _end - _start
+            if location in ("LocalCPUBackend", "LocalDiskBackend"):
+                if location == "LocalCPUBackend":
+                    load_name = "cpu_prepare_per_token"
+                if location == "LocalDiskBackend":
+                    load_name = "ssd2cpu_per_token"
+                time_ctx = (scheduling_guidance.time_block(load_name, retrieved_tokens)
+                    if scheduling_guidance is not None
+                    else nullcontext())
+                with time_ctx:
+                    memory_objs = self.storage_manager.batched_get(
+                        keys=keys,
+                        location=location,
+                    )
+                    # print(f"MY LOG: time(ns): {scheduling_guidance.ssd2cpu_per_token}, tokens: {retrieved_tokens}")  
+            else:
+                memory_objs = self.storage_manager.batched_get(
+                        keys=keys,
+                        location=location,
+                    )
             assert memory_objs is not None, (
                 "Failed to get memory objects from storage backend"
             )

@@ -1,0 +1,8 @@
+{
+  "include": ["."],
+  "extraPaths": ["/home/yshan/Programs/vllm-scheduling-optimized"],
+  "typeCheckingMode": "off",
+  "reportInvalidTypeForm": "none",
+  "reportArgumentType": "none",
+  "reportOptionalMemberAccess": "none",
+}

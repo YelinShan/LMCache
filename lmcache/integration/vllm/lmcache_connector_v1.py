@@ -139,6 +139,15 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             request, num_computed_tokens
         ), False
 
+    def get_num_new_matched_tokens_detailed(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[tuple, bool]:
+        return self._lmcache_engine.get_num_new_matched_tokens_detailed(
+            request, num_computed_tokens
+        ), False
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
